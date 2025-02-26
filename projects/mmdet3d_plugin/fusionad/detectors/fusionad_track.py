@@ -322,7 +322,7 @@ class FusionADTrack(MVXTwoStageDetector):
 
         ref_pts = reference_points @ l2g_r1 + l2g_t1 - l2g_t2
 
-        g2l_r = torch.linalg.inv(l2g_r2).type(torch.float)
+        g2l_r = torch.linalg.inv(l2g_r2.cpu()).type(torch.float).cuda(0)
 
         ref_pts = ref_pts @ g2l_r
 

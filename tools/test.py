@@ -23,7 +23,49 @@ from mmdet.datasets import replace_ImageToTensor
 import time
 import os.path as osp
 
+import matplotlib.pyplot as plt
+import numpy as np
+import pickle
+
 warnings.filterwarnings("ignore")
+
+activations = {} 
+
+def tensor_to_heatmap(feature_map: torch.Tensor) -> np.ndarray:
+    """
+    feature_map: 形状が (C, H, W) のTensor (1枚のカメラ分)を想定。
+    戻り値: ヒートマップ（カラー）のBGR画像 (H, W, 3)
+    """
+    # ---- 1. チャネル方向を平均して1枚にする (H, W)
+    # 必要に応じて mean/max/sum などを切り替える
+    heatmap = feature_map.mean(dim=0)  # -> shape: (H, W)
+
+    # ---- 2. テンソル → numpy & 正規化
+    heatmap = heatmap.detach().cpu().numpy()
+    heatmap -= heatmap.min()
+    if heatmap.max() > 0:
+        heatmap /= heatmap.max()
+    heatmap = (heatmap * 255).astype(np.uint8)
+
+    # ---- 3. カラーマップを適用 (OpenCVはBGR)
+    heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+    return heatmap_color
+
+def overlay_heatmap_on_image(image_bgr: np.ndarray, heatmap_bgr: np.ndarray, alpha=0.5) -> np.ndarray:
+    """
+    image_bgr: 元画像 (H, W, 3)
+    heatmap_bgr: ヒートマップ (H, W, 3)
+    alpha: ヒートマップ重ねる割合
+    戻り値: ヒートマップを重ね合わせたBGR画像
+    """
+    # サイズが違う場合は合わせる
+    if (image_bgr.shape[0] != heatmap_bgr.shape[0]) or (image_bgr.shape[1] != heatmap_bgr.shape[1]):
+        heatmap_bgr = cv2.resize(heatmap_bgr, (image_bgr.shape[1], image_bgr.shape[0]))
+
+    # addWeighted でオーバーレイ
+    overlaid = cv2.addWeighted(image_bgr, 1 - alpha, heatmap_bgr, alpha, 0)
+    return overlaid
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -162,7 +204,7 @@ def main():
 
     cfg.model.pretrained = None
     # in case the test dataset is concatenated
-    samples_per_gpu = 2
+    samples_per_gpu = 1
     if isinstance(cfg.data.test, dict):
         cfg.data.test.test_mode = True
         samples_per_gpu = cfg.data.test.pop('samples_per_gpu', 1)
@@ -210,6 +252,68 @@ def main():
     checkpoint = load_checkpoint(model, args.checkpoint, map_location='cpu')
     if args.fuse_conv_bn:
         model = fuse_conv_bn(model)
+
+    def get_activation_hook(name):
+        def hook(module, input, output):
+            print(f"[HOOK CALLED] {name}")
+            if name not in activations:
+                activations[name] = [] 
+
+            # module: フックを登録した層 (nn.Module)
+            # input:  その層に入ってきた入力 (tuple of Tensor)
+            # output: その層から出力される出力 (Tensor or tuple of Tensor)
+
+            x = input[0] if isinstance(input, (list, tuple)) else input
+            if isinstance(x, torch.Tensor):
+                print(f"[{name}] input shape: {x.shape}")
+            else:
+                print(f"[{name}] input is a {type(x)}")
+
+            # 出力に対して
+            if isinstance(output, torch.Tensor):
+                # 通常のTensorの場合
+                print(f"[{name}] output shape: {output.shape}")
+            elif isinstance(output, (list, tuple)):
+                # タプルやリストなら要素ごとに
+                for i, out in enumerate(output):
+                    if isinstance(out, torch.Tensor):
+                        print(f"[{name}] output[{i}] shape: {out.shape}")
+                    else:
+                        print(f"[{name}] output[{i}] is a {type(out)}")
+            else:
+                print(f"[{name}] output is a {type(output)}")
+            
+            activations[name].append(output.detach().cpu())
+            print(f'activation shape: {output.shape}')
+            print(f'activation shape: {activations[name][-1].shape}')
+        return hook
+
+    print('--- Named Modules ---')
+    count = 0
+    for name, module in model.named_modules():
+        if 'img_backbone.layer4' in name:
+            print(name, "->", module.__class__.__name__)
+            count += 1
+
+    for name, module in model.named_modules():
+        if 'img_neck.fpn' in name:
+            print(name, "->", module.__class__.__name__)
+
+    print(f"Total modules containing 'img_backbone.layer4': {count}")
+
+    # for name, module in model.named_modules():
+    #     print(name, module)
+
+    valid_names = [
+        'img_backbone.layer4.2'
+    ]
+
+    for name, module in model.named_modules():
+        # print(f'Registering hook for {name}')
+        if name in valid_names:
+            print(f'Registering hook for {name}')
+            module.register_forward_hook(get_activation_hook(name))
+
     # old versions did not save class info in checkpoints, this walkaround is
     # for backward compatibility
     if 'CLASSES' in checkpoint.get('meta', {}):
@@ -238,6 +342,69 @@ def main():
                                         args.gpu_collect)
    
     rank, _ = get_dist_info()
+
+    pkl_path = '/home/yoshi-22/FusionAD/UniAD/data/infos/nuscenes_infos_temporal_val.pkl'
+    with open(pkl_path, 'rb') as f:
+        data = pickle.load(f)
+    
+    infos = data['infos']
+
+    cam_out_path = [
+        '/home/yoshi-22/FusionAD/outputs/CAM_FRONT',
+        '/home/yoshi-22/FusionAD/outputs/CAM_FRONT_RIGHT',
+        '/home/yoshi-22/FusionAD/outputs/CAM_FRONT_LEFT',
+        '/home/yoshi-22/FusionAD/outputs/CAM_BACK',
+        '/home/yoshi-22/FusionAD/outputs/CAM_BACK_LEFT',
+        '/home/yoshi-22/FusionAD/outputs/CAM_BACK_RIGHT'
+    ]
+
+    cam_names = [
+        'CAM_FRONT',
+        'CAM_FRONT_RIGHT',
+        'CAM_FRONT_LEFT',
+        'CAM_BACK',
+        'CAM_BACK_LEFT',
+        'CAM_BACK_RIGHT'
+    ]
+
+    name = 'img_backbone.layer4.2'
+    my_activations = outputs['my_activations']
+
+    for i in sorted(my_activations[name].keys()):
+
+        feat_i = my_activations[name][i]
+        print(f"Processing frame {i}")
+        info_i = infos[i]
+
+        for cam_idx in range(6):
+            single_feat_map = feat_i[cam_idx]
+            # カメラごとのファイル名に cam_names[cam_idx] を入れる
+            heatmap_bgr = tensor_to_heatmap(single_feat_map)
+
+            # 入力画像のパス
+            img_path = info_i['cams'][cam_names[cam_idx]]['data_path']
+            print(f"Reading image: {img_path}")
+            image_bgr = cv2.imread(img_path)
+            if image_bgr is None:
+                print(f"Failed to read image: {img_path}")
+                continue
+
+            # feat[cam_idx] → (C, H, W)
+            overlaid = overlay_heatmap_on_image(image_bgr, heatmap_bgr, alpha=0.5)
+
+            # 出力ファイル名
+            out_name = os.path.basename(img_path)
+            # ディレクトリが存在するかを事前にチェック
+            if not os.path.exists(cam_out_path[cam_idx]):
+                os.makedirs(cam_out_path[cam_idx], exist_ok=True)
+                print(f"Directory created: {cam_out_path[cam_idx]}")
+            else:
+                print(f"Directory already exists: {cam_out_path[cam_idx]}")
+            out_path = os.path.join(cam_out_path[cam_idx], out_name)
+            cv2.imwrite(out_path, overlaid)
+            print(f"Heatmap saved to {out_path}")
+
+
     if rank == 0:
         if args.result_file != None:
             outputs = mmcv.load(args.out)

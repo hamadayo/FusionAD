@@ -362,6 +362,10 @@ class FusionAD(FusionADTrack):
                 result_planning=result_planning,
             )
 
+        # !!!!! planning用 'self_attn_list' と 'cross_attn_list' を result'bbox_results' に直接追加
+        result[0]['self_attn_list'] = result_planning.get('self_attn_list', [])
+        result[0]['cross_attn_list'] = result_planning.get('cross_attn_list', [])
+
         if self.with_seg_head:
             del result_seg[0]['args_tuple']
         
@@ -369,7 +373,7 @@ class FusionAD(FusionADTrack):
         result_track[0] = pop_elem_in_result(result_track[0], pop_track_list)
 
         if self.with_seg_head:
-            result_seg[0] = pop_elem_in_result(result_seg[0], pop_list=['pts_bbox'])
+            result_seg[0] = pop_elem_in_result(result_seg[0], pop_list=['pts_bbox','args_tuple'])
         if self.with_motion_head:
             result_motion[0] = pop_elem_in_result(result_motion[0])
         if self.with_occ_head:

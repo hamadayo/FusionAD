@@ -83,11 +83,30 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     if rank == 0:
         prog_bar = mmcv.ProgressBar(len(dataset))
     time.sleep(2)  # This line can prevent deadlock problem in some cases.
+
+    # !!!!!!個々変更
+    valid_names = [
+        'img_backbone.layer4.2',
+    ]
+    my_activations = {name: {} for name in valid_names}
+    import __main__
+    activations = getattr(__main__, 'activations', {'aaaaa'})
+
     have_mask = False
     num_occ = 0
     for i, data in enumerate(data_loader):
         with torch.no_grad():
             result = model(return_loss=False, rescale=True, **data)
+            print("Keys in result[0]:", result[0].keys())
+
+            for name in valid_names:
+                if name in activations:
+                    print(f'custom class name in : {name}')
+                    if name not in my_activations:
+                        my_activations[name] = {}
+                    my_activations[name][i] = activations[name][i].detach().cpu()
+                    print(f'length of my_activations cus: {len(my_activations[name])}')
+                    print(f'length of activations cus: {len(activations[name])}')
 
             # EVAL planning
             if eval_planning:
@@ -165,6 +184,9 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
 
     ret_results = dict()
     ret_results['bbox_results'] = bbox_results
+
+    ret_results['my_activations'] = my_activations
+    
     if eval_occ:
         occ_results = {}
         for key, grid in EVALUATION_RANGES.items():
